@@ -58,9 +58,6 @@ fn run(args: &Args) -> Result<u8> {
         eprintln!("{} doesn't appear to be a valid PKG file", args.pkg.display());
         return Ok(1);
     }
-    if args.info {
-        println!("{} is a valid PKG", args.pkg.display());
-    }
 
     let mut pkg = pkg::Pkg::open(&args.pkg).context("Cannot open PKG file")?;
     let sfo = psf::Psf::parse(&pkg.sfo).context("Could not read SFO")?;
@@ -72,6 +69,7 @@ fn run(args: &Args) -> Result<u8> {
     let output_root = args.output.clone().unwrap_or_else(|| PathBuf::from("."));
     let mut output = output_root.join(&title_id);
 
+    let mut missing_content_id = false;
     let (return_code, kind): (u8, &str) = if flags.contains("PATCH") {
         (102, "game update")
     } else if category == "ac" {
@@ -79,24 +77,25 @@ fn run(args: &Args) -> Result<u8> {
             if let Some(entitlement) = cid.split('-').nth(2) {
                 output.push(entitlement);
             }
-        } else if args.info {
-            println!("PSF file: there is no CONTENT_ID");
+        } else {
+            missing_content_id = true;
         }
         (103, "dlc")
     } else {
         (101, "base game")
     };
-    if args.info {
-        println!("pkg is a {kind}");
-    }
 
     if args.check_type {
         return Ok(return_code);
     }
 
     if args.info {
-        let verb = if args.list { "Listing" } else { "Extracting pkg to" };
-        println!("{verb} {}", output.display());
+        println!("{} is a valid PKG", args.pkg.display());
+        println!("pkg is a {kind}");
+        if missing_content_id {
+            println!("PSF file: there is no CONTENT_ID");
+        }
+        return Ok(0);
     }
 
     pkg.prepare(&output).context("Cannot prepare PKG")?;
