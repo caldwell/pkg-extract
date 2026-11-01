@@ -138,9 +138,15 @@ pub struct FsTableEntry {
 pub struct SceSysEntry {
     pub name: String,
     pub size: u32,
+    pub offset: u32,
+    pub id: u32,
+    pub raw: [u8; 32],
 }
 
 impl FsTableEntry {
+    pub fn is_file(&self) -> bool {
+        self.ty == PFS_FILE
+    }
     pub fn is_dir(&self) -> bool {
         self.ty == PFS_DIR
     }
@@ -164,6 +170,7 @@ pub struct Pkg {
     sector_map: Vec<u64>,
     pfsc_offset: u64,
     extract_paths: HashMap<u32, PathBuf>,
+    dk3: [u8; 32],
     data_key: [u8; 16],
     tweak_key: [u8; 16],
 }
@@ -229,6 +236,7 @@ impl Pkg {
             sector_map: Vec::new(),
             pfsc_offset: 0,
             extract_paths: HashMap::new(),
+            dk3: [0u8; 32],
             data_key: [0u8; 16],
             tweak_key: [0u8; 16],
         })
@@ -264,10 +272,10 @@ impl Pkg {
         self.inode_buf.get(entry.inode as usize)
     }
 
-    /// Derives the PFS keys and walks inodes/dirents to populate the file list, optionally
-    /// writing the sce_sys/* entries and creating directories as it goes. Must be called
-    /// before [`Pkg::extract_file`].
-    pub fn prepare(&mut self, extract_path: &Path, write_files: bool) -> Result<()> {
+    /// Derives the PFS keys and walks inodes/dirents to populate the file lists. Must be
+    /// called before any `extract_*` method. Does not write any files; callers drive the
+    /// writes themselves so they can report progress.
+    pub fn prepare(&mut self, extract_path: &Path) -> Result<()> {
         self.extract_path = extract_path.to_path_buf();
 
         let n_files = self.header.pkg_table_entry_count as usize;
@@ -277,7 +285,6 @@ impl Pkg {
         let mut table_buf = vec![0u8; n_files * PKG_ENTRY_SIZE];
         self.file.read_exact(&mut table_buf).context("read PKG table")?;
 
-        let mut dk3 = [0u8; 32];
         let mut iv_key = [0u8; 32];
         let mut img_key = [0u8; 256];
         let mut ekpfs_key = [0u8; 32];
@@ -285,31 +292,19 @@ impl Pkg {
         for i in 0..n_files {
             let entry =
                 PkgEntry::parse(&table_buf[i * PKG_ENTRY_SIZE..(i + 1) * PKG_ENTRY_SIZE]);
-            let name = entry_name_by_type(entry.id);
-
-            let out_name: String = if name.is_empty() {
+            let known_name = entry_name_by_type(entry.id);
+            let out_name = if known_name.is_empty() {
                 entry.id.to_string()
             } else {
-                name.to_string()
+                known_name.to_string()
             };
             self.sce_sys_entries.push(SceSysEntry {
-                name: out_name.clone(),
+                name: out_name,
                 size: entry.size,
+                offset: entry.offset,
+                id: entry.id,
+                raw: entry.raw,
             });
-            let out_path = self.extract_path.join("sce_sys").join(&out_name);
-            if write_files {
-                if let Some(p) = out_path.parent() {
-                    std::fs::create_dir_all(p)
-                        .with_context(|| format!("mkdir {}", p.display()))?;
-                }
-            }
-
-            if name.is_empty() {
-                if write_files {
-                    self.copy_entry_to_file(&entry, &out_path)?;
-                }
-                continue;
-            }
 
             match entry.id {
                 0x10 => {
@@ -324,7 +319,7 @@ impl Pkg {
                     for k in key1.iter_mut() {
                         self.file.read_exact(k)?;
                     }
-                    crypto::rsa2048_decrypt(&mut dk3, &key1[3], true)?;
+                    crypto::rsa2048_decrypt(&mut self.dk3, &key1[3], true)?;
                 }
                 0x20 => {
                     self.file.seek(SeekFrom::Start(entry.offset as u64))?;
@@ -333,7 +328,7 @@ impl Pkg {
 
                     let mut combined = [0u8; 64];
                     combined[..PKG_ENTRY_SIZE].copy_from_slice(&entry.raw);
-                    combined[PKG_ENTRY_SIZE..].copy_from_slice(&dk3);
+                    combined[PKG_ENTRY_SIZE..].copy_from_slice(&self.dk3);
 
                     crypto::iv_key_hash256(&mut iv_key, &combined);
                     let decrypted = crypto::aes_cbc_decrypt(&iv_key, &img_key_data)?;
@@ -341,29 +336,6 @@ impl Pkg {
                     crypto::rsa2048_decrypt(&mut ekpfs_key, &img_key, false)?;
                 }
                 _ => {}
-            }
-
-            if write_files {
-                self.copy_entry_to_file(&entry, &out_path)?;
-
-                if matches!(entry.id, 0x400 | 0x401 | 0x402 | 0x403) {
-                    let r_size = entry.size as usize;
-                    let m_size = r_size.div_ceil(16) * 16;
-                    self.file.seek(SeekFrom::Start(entry.offset as u64))?;
-                    let mut data = vec![0u8; r_size];
-                    self.file.read_exact(&mut data)?;
-                    data.resize(m_size, 0);
-
-                    let mut combined = [0u8; 64];
-                    combined[..PKG_ENTRY_SIZE].copy_from_slice(&entry.raw);
-                    combined[PKG_ENTRY_SIZE..].copy_from_slice(&dk3);
-                    let mut entry_iv_key = [0u8; 32];
-                    crypto::iv_key_hash256(&mut entry_iv_key, &combined);
-                    let mut dec = crypto::aes_cbc_decrypt(&entry_iv_key, &data)?;
-                    dec.truncate(r_size);
-                    std::fs::write(&out_path, &dec)
-                        .with_context(|| format!("write {}", out_path.display()))?;
-                }
             }
         }
 
@@ -523,11 +495,6 @@ impl Pkg {
                     }
 
                     if entry.ty == PFS_FILE || entry.ty == PFS_DIR {
-                        if entry.ty == PFS_DIR && write_files {
-                            let dir = self.extract_paths.get(&entry.inode).unwrap().clone();
-                            std::fs::create_dir_all(&dir)
-                                .with_context(|| format!("mkdir {}", dir.display()))?;
-                        }
                         ndinode_counter += 1;
                         if ndinode_counter + 1 == ndinode {
                             end_reached = true;
@@ -547,17 +514,69 @@ impl Pkg {
         Ok(())
     }
 
-    fn copy_entry_to_file(&mut self, entry: &PkgEntry, out_path: &Path) -> Result<()> {
-        self.file.seek(SeekFrom::Start(entry.offset as u64))?;
-        let mut data = vec![0u8; entry.size as usize];
+    /// Creates all directories recorded in the PFS walk. Call before `extract_file`.
+    pub fn create_directories(&self) -> Result<()> {
+        for entry in &self.fs_table {
+            if entry.is_dir() {
+                if let Some(path) = self.extract_paths.get(&entry.inode) {
+                    std::fs::create_dir_all(path)
+                        .with_context(|| format!("mkdir {}", path.display()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes one pkg-table entry to `extract_path/sce_sys/<name>`. `index` is in
+    /// `0..sce_sys_entries().len()`. `on_bytes` is called with the plaintext byte count
+    /// once the file has been written.
+    pub fn extract_sce_sys<F: FnMut(u64)>(
+        &mut self,
+        index: usize,
+        mut on_bytes: F,
+    ) -> Result<()> {
+        let entry = &self.sce_sys_entries[index];
+        let (offset, size, id, raw) = (entry.offset, entry.size, entry.id, entry.raw);
+        let out_path = self.extract_path.join("sce_sys").join(&entry.name);
+        if let Some(p) = out_path.parent() {
+            std::fs::create_dir_all(p).with_context(|| format!("mkdir {}", p.display()))?;
+        }
+
+        self.file.seek(SeekFrom::Start(offset as u64))?;
+        let mut data = vec![0u8; size as usize];
         self.file.read_exact(&mut data)?;
-        std::fs::write(out_path, &data)
+        std::fs::write(&out_path, &data)
             .with_context(|| format!("write {}", out_path.display()))?;
+
+        // Encrypted blobs: license.*, nptitle.dat, npbind.dat. Decrypt with an ivKey
+        // derived from the entry header + dk3 and overwrite the plaintext in place.
+        if matches!(id, 0x400 | 0x401 | 0x402 | 0x403) {
+            let r_size = size as usize;
+            let m_size = r_size.div_ceil(16) * 16;
+            data.resize(m_size, 0);
+
+            let mut combined = [0u8; 64];
+            combined[..PKG_ENTRY_SIZE].copy_from_slice(&raw);
+            combined[PKG_ENTRY_SIZE..].copy_from_slice(&self.dk3);
+            let mut entry_iv_key = [0u8; 32];
+            crypto::iv_key_hash256(&mut entry_iv_key, &combined);
+            let mut dec = crypto::aes_cbc_decrypt(&entry_iv_key, &data)?;
+            dec.truncate(r_size);
+            std::fs::write(&out_path, &dec)
+                .with_context(|| format!("write {}", out_path.display()))?;
+        }
+        on_bytes(size as u64);
         Ok(())
     }
 
     /// Writes one file from the PFS image to disk. `index` is in `0..file_count()`.
-    pub fn extract_file(&mut self, index: usize) -> Result<()> {
+    /// `on_bytes` is invoked after each block flush with the number of plaintext bytes
+    /// just written, so callers can drive a byte-granular progress indicator.
+    pub fn extract_file<F: FnMut(u64)>(
+        &mut self,
+        index: usize,
+        mut on_bytes: F,
+    ) -> Result<()> {
         let entry = &self.fs_table[index];
         if entry.ty != PFS_FILE {
             return Ok(());
@@ -623,12 +642,13 @@ impl Pkg {
             }
 
             size_decompressed += SECTOR_SIZE;
-            if j < nblocks - 1 {
-                out.write_all(&decompressed)?;
+            let write_size = if j < nblocks - 1 {
+                SECTOR_SIZE
             } else {
-                let write_size = SECTOR_SIZE - (size_decompressed - bsize);
-                out.write_all(&decompressed[..write_size])?;
-            }
+                SECTOR_SIZE - (size_decompressed - bsize)
+            };
+            out.write_all(&decompressed[..write_size])?;
+            on_bytes(write_size as u64);
         }
         out.flush()?;
         Ok(())

@@ -1,9 +1,10 @@
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 
 mod crypto;
 mod keys;
@@ -98,8 +99,7 @@ fn run(args: &Args) -> Result<u8> {
         println!("{verb} {}", output.display());
     }
 
-    pkg.prepare(&output, !args.list)
-        .context("Cannot prepare PKG")?;
+    pkg.prepare(&output).context("Cannot prepare PKG")?;
 
     if args.list {
         for sce in pkg.sce_sys_entries() {
@@ -127,18 +127,93 @@ fn run(args: &Args) -> Result<u8> {
         return Ok(0);
     }
 
-    let n = pkg.file_count();
-    for i in 0..n {
-        print!("\r      Extracting file {} of {}", i + 1, n);
-        std::io::stdout().flush().ok();
-        pkg.extract_file(i)
-            .with_context(|| format!("extracting file index {i}"))?;
-    }
-    if n > 0 {
-        println!();
-    }
+    pkg.create_directories().context("creating directories")?;
+    extract_with_progress(&mut pkg)?;
 
     Ok(0)
+}
+
+fn extract_with_progress(pkg: &mut pkg::Pkg) -> Result<()> {
+    let total_files = pkg.sce_sys_entries().len()
+        + pkg.files().iter().filter(|e| e.is_file()).count();
+    let total_bytes: u64 = pkg
+        .sce_sys_entries()
+        .iter()
+        .map(|e| e.size as u64)
+        .sum::<u64>()
+        + pkg
+            .files()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                e.is_file()
+                    .then(|| pkg.file_inode(i).map(|ino| ino.size.max(0) as u64).unwrap_or(0))
+            })
+            .sum::<u64>();
+
+    let multi = MultiProgress::new();
+
+    let bar = multi.add(ProgressBar::new(total_bytes));
+    bar.set_style(
+        ProgressStyle::with_template(
+            "{elapsed_precise} {wide_bar:.on_cyan/on_17} {eta_precise}",
+        )
+        .unwrap()
+        .progress_chars("   "),
+    );
+
+    let path = multi.add(ProgressBar::new_spinner());
+    path.set_style(
+        ProgressStyle::with_template("{spinner} {prefix:<10.245} {msg:!.214}").unwrap(),
+    );
+    path.enable_steady_tick(Duration::from_millis(100));
+
+    let totals = multi.add(ProgressBar::new_spinner());
+    totals.set_style(
+        ProgressStyle::with_template("{msg}, elapsed: {elapsed_precise}").unwrap(),
+    );
+    totals.enable_steady_tick(Duration::from_millis(100));
+
+    let update_totals = |done: usize| {
+        totals.set_message(format!(
+            "{done}/{total_files} files, {} / {}",
+            HumanBytes(bar.position()),
+            HumanBytes(total_bytes),
+        ));
+    };
+    update_totals(0);
+
+    let mut done = 0usize;
+    for i in 0..pkg.sce_sys_entries().len() {
+        let name = pkg.sce_sys_entries()[i].name.clone();
+        path.set_prefix(format!("[{}/{total_files}]", done + 1));
+        path.set_message(format!("sce_sys/{name}"));
+        pkg.extract_sce_sys(i, |n| bar.inc(n))
+            .with_context(|| format!("extracting sce_sys/{name}"))?;
+        done += 1;
+        update_totals(done);
+    }
+
+    for i in 0..pkg.file_count() {
+        if !pkg.files()[i].is_file() {
+            continue;
+        }
+        let display = pkg
+            .file_path(i)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        path.set_prefix(format!("[{}/{total_files}]", done + 1));
+        path.set_message(display);
+        pkg.extract_file(i, |n| bar.inc(n))
+            .with_context(|| format!("extracting file index {i}"))?;
+        done += 1;
+        update_totals(done);
+    }
+
+    bar.finish();
+    path.finish_and_clear();
+    totals.finish();
+    Ok(())
 }
 
 fn print_verbose_sce_sys(size: u32, path: &str) {

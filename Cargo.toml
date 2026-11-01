@@ -12,3 +12,4 @@ rsa = "0.9"
 flate2 = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
