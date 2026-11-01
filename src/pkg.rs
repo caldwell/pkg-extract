@@ -102,28 +102,51 @@ impl PkgEntry {
     }
 }
 
-struct Inode {
-    mode: u16,
-    size: i64,
-    blocks: u32,
-    loc: u32,
+pub struct Inode {
+    pub mode: u16,
+    pub nlink: u16,
+    pub size: i64,
+    pub mtime_sec: i64,
+    pub uid: u32,
+    pub gid: u32,
+    pub blocks: u32,
+    pub loc: u32,
 }
 
 impl Inode {
     fn parse(buf: &[u8]) -> Self {
         Self {
             mode: u16::from_le_bytes(buf[0..2].try_into().unwrap()),
+            nlink: u16::from_le_bytes(buf[2..4].try_into().unwrap()),
             size: i64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            // Time1..Time4 are atime, mtime, ctime, btime at offsets 0x18/0x20/0x28/0x30.
+            mtime_sec: i64::from_le_bytes(buf[0x20..0x28].try_into().unwrap()),
+            uid: u32::from_le_bytes(buf[0x48..0x4C].try_into().unwrap()),
+            gid: u32::from_le_bytes(buf[0x4C..0x50].try_into().unwrap()),
             blocks: u32::from_le_bytes(buf[0x60..0x64].try_into().unwrap()),
             loc: u32::from_le_bytes(buf[0x64..0x68].try_into().unwrap()),
         }
     }
 }
 
-struct FsTableEntry {
-    name: String,
-    inode: u32,
-    ty: u32,
+pub struct FsTableEntry {
+    pub name: String,
+    pub inode: u32,
+    pub ty: u32,
+}
+
+pub struct SceSysEntry {
+    pub name: String,
+    pub size: u32,
+}
+
+impl FsTableEntry {
+    pub fn is_dir(&self) -> bool {
+        self.ty == PFS_DIR
+    }
+    pub fn is_pseudo(&self) -> bool {
+        self.ty == PFS_CURRENT_DIR || self.ty == PFS_PARENT_DIR
+    }
 }
 
 pub struct Pkg {
@@ -136,6 +159,7 @@ pub struct Pkg {
 
     extract_path: PathBuf,
     fs_table: Vec<FsTableEntry>,
+    sce_sys_entries: Vec<SceSysEntry>,
     inode_buf: Vec<Inode>,
     sector_map: Vec<u64>,
     pfsc_offset: u64,
@@ -200,6 +224,7 @@ impl Pkg {
             sfo,
             extract_path: PathBuf::new(),
             fs_table: Vec::new(),
+            sce_sys_entries: Vec::new(),
             inode_buf: Vec::new(),
             sector_map: Vec::new(),
             pfsc_offset: 0,
@@ -221,9 +246,28 @@ impl Pkg {
         self.fs_table.len()
     }
 
-    /// Writes the sce_sys/* entries, decrypts the PFS image header, and walks inodes/dirents
-    /// so that the per-file calls to [`Pkg::extract_file`] can run.
-    pub fn extract(&mut self, extract_path: &Path) -> Result<()> {
+    pub fn files(&self) -> &[FsTableEntry] {
+        &self.fs_table
+    }
+
+    pub fn file_path(&self, index: usize) -> Option<&Path> {
+        let entry = self.fs_table.get(index)?;
+        self.extract_paths.get(&entry.inode).map(PathBuf::as_path)
+    }
+
+    pub fn sce_sys_entries(&self) -> &[SceSysEntry] {
+        &self.sce_sys_entries
+    }
+
+    pub fn file_inode(&self, index: usize) -> Option<&Inode> {
+        let entry = self.fs_table.get(index)?;
+        self.inode_buf.get(entry.inode as usize)
+    }
+
+    /// Derives the PFS keys and walks inodes/dirents to populate the file list, optionally
+    /// writing the sce_sys/* entries and creating directories as it goes. Must be called
+    /// before [`Pkg::extract_file`].
+    pub fn prepare(&mut self, extract_path: &Path, write_files: bool) -> Result<()> {
         self.extract_path = extract_path.to_path_buf();
 
         let n_files = self.header.pkg_table_entry_count as usize;
@@ -248,13 +292,22 @@ impl Pkg {
             } else {
                 name.to_string()
             };
+            self.sce_sys_entries.push(SceSysEntry {
+                name: out_name.clone(),
+                size: entry.size,
+            });
             let out_path = self.extract_path.join("sce_sys").join(&out_name);
-            if let Some(p) = out_path.parent() {
-                std::fs::create_dir_all(p).with_context(|| format!("mkdir {}", p.display()))?;
+            if write_files {
+                if let Some(p) = out_path.parent() {
+                    std::fs::create_dir_all(p)
+                        .with_context(|| format!("mkdir {}", p.display()))?;
+                }
             }
 
             if name.is_empty() {
-                self.copy_entry_to_file(&entry, &out_path)?;
+                if write_files {
+                    self.copy_entry_to_file(&entry, &out_path)?;
+                }
                 continue;
             }
 
@@ -290,25 +343,27 @@ impl Pkg {
                 _ => {}
             }
 
-            self.copy_entry_to_file(&entry, &out_path)?;
+            if write_files {
+                self.copy_entry_to_file(&entry, &out_path)?;
 
-            if matches!(entry.id, 0x400 | 0x401 | 0x402 | 0x403) {
-                let r_size = entry.size as usize;
-                let m_size = r_size.div_ceil(16) * 16;
-                self.file.seek(SeekFrom::Start(entry.offset as u64))?;
-                let mut data = vec![0u8; r_size];
-                self.file.read_exact(&mut data)?;
-                data.resize(m_size, 0);
+                if matches!(entry.id, 0x400 | 0x401 | 0x402 | 0x403) {
+                    let r_size = entry.size as usize;
+                    let m_size = r_size.div_ceil(16) * 16;
+                    self.file.seek(SeekFrom::Start(entry.offset as u64))?;
+                    let mut data = vec![0u8; r_size];
+                    self.file.read_exact(&mut data)?;
+                    data.resize(m_size, 0);
 
-                let mut combined = [0u8; 64];
-                combined[..PKG_ENTRY_SIZE].copy_from_slice(&entry.raw);
-                combined[PKG_ENTRY_SIZE..].copy_from_slice(&dk3);
-                let mut entry_iv_key = [0u8; 32];
-                crypto::iv_key_hash256(&mut entry_iv_key, &combined);
-                let mut dec = crypto::aes_cbc_decrypt(&entry_iv_key, &data)?;
-                dec.truncate(r_size);
-                std::fs::write(&out_path, &dec)
-                    .with_context(|| format!("write {}", out_path.display()))?;
+                    let mut combined = [0u8; 64];
+                    combined[..PKG_ENTRY_SIZE].copy_from_slice(&entry.raw);
+                    combined[PKG_ENTRY_SIZE..].copy_from_slice(&dk3);
+                    let mut entry_iv_key = [0u8; 32];
+                    crypto::iv_key_hash256(&mut entry_iv_key, &combined);
+                    let mut dec = crypto::aes_cbc_decrypt(&entry_iv_key, &data)?;
+                    dec.truncate(r_size);
+                    std::fs::write(&out_path, &dec)
+                        .with_context(|| format!("write {}", out_path.display()))?;
+                }
             }
         }
 
@@ -425,22 +480,8 @@ impl Pkg {
                     if dirent.ino != 0 {
                         ndinode_counter += 1;
                     } else {
-                        let parent_path = self.extract_path.parent().unwrap_or(Path::new(""));
-                        let filename_matches = parent_path
-                            .file_name()
-                            .map(|f| f.to_string_lossy() == self.title_id)
-                            .unwrap_or(false);
-                        let ends_with_patch = self
-                            .extract_path
-                            .to_string_lossy()
-                            .ends_with("-patch");
-
-                        let target = if !filename_matches && !ends_with_patch {
-                            parent_path.join(&self.title_id)
-                        } else {
-                            self.extract_path.clone()
-                        };
-                        self.extract_paths.insert(ndinode_counter, target);
+                        self.extract_paths
+                            .insert(ndinode_counter, self.extract_path.clone());
                         uroot_reached = false;
                         break;
                     }
@@ -476,12 +517,13 @@ impl Pkg {
                         if let Some(p) = self.extract_paths.get(&entry.inode) {
                             current_dir = p.clone();
                         }
+                    } else if entry.ty == PFS_FILE || entry.ty == PFS_DIR {
+                        self.extract_paths
+                            .insert(entry.inode, current_dir.join(&entry.name));
                     }
-                    self.extract_paths
-                        .insert(entry.inode, current_dir.join(&entry.name));
 
                     if entry.ty == PFS_FILE || entry.ty == PFS_DIR {
-                        if entry.ty == PFS_DIR {
+                        if entry.ty == PFS_DIR && write_files {
                             let dir = self.extract_paths.get(&entry.inode).unwrap().clone();
                             std::fs::create_dir_all(&dir)
                                 .with_context(|| format!("mkdir {}", dir.display()))?;
