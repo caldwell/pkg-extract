@@ -32,7 +32,7 @@ Build with `cargo build --release`.
 License
 -------
 
-Copyright © 2022 David Caldwell <david_pkgextract@porkrind.org>
+Copyright © 2026 David Caldwell <david_pkgextract@porkrind.org>
 
 *TLDR: [GPLv3](LICENSE.md). You can redistribute the .exe (or a modified
 version) as long as you ship the source code used to build it alongside.*
