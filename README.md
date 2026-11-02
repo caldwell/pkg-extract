@@ -2,7 +2,7 @@ pkg-extract
 ===========
 
 A command-line extractor for PlayStation 4 `.pkg` files, written in Rust.
-Based on the shadPS4 pkg extractor.
+Based on the [shadPS4 pkg extractor](https://github.com/AzaharPlus/shadPS4Plus).
 
 Usage
 -----
